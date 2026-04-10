@@ -8,6 +8,7 @@ import {
 } from 'src/services/settingsSync/index.js'
 import { waitForRemoteManagedSettingsToLoad } from 'src/services/remoteManagedSettings/index.js'
 import { StructuredIO } from 'src/cli/structuredIO.js'
+import { ImIO, type FeishuReceiveIdType } from 'src/cli/imIO.js'
 import { RemoteIO } from 'src/cli/remoteIO.js'
 import {
   type Command,
@@ -45,6 +46,7 @@ import {
   dequeueAllMatching,
   enqueue,
   hasCommandsInQueue,
+  isSlashCommand,
   peek,
   subscribeToCommandQueue,
   getCommandsByMaxPriority,
@@ -466,6 +468,8 @@ export async function runHeadless(
     resumeSessionAt: string | undefined
     verbose: boolean | undefined
     outputFormat: string | undefined
+    im: 'feishu' | undefined
+    imChatId?: string | undefined
     jsonSchema: Record<string, unknown> | undefined
     permissionPromptToolName: string | undefined
     allowedTools: string[] | undefined
@@ -776,7 +780,7 @@ export async function runHeadless(
     (Boolean(validateUuid(options.resume)) || options.resume.endsWith('.jsonl'))
   const isUsingSdkUrl = Boolean(options.sdkUrl)
 
-  if (!inputPrompt && !hasValidResumeSessionId && !isUsingSdkUrl) {
+  if (!inputPrompt && !hasValidResumeSessionId && !isUsingSdkUrl && !options.im) {
     process.stderr.write(
       `Error: Input must be provided either through stdin or as a prompt argument when using --print\n`,
     )
@@ -875,6 +879,7 @@ export async function runHeadless(
     options,
     turnInterruptionState,
   )) {
+    //console.log(JSON.stringify(message))
     if (transformToStreamlined) {
       // Streamlined mode: transform messages and stream immediately
       const transformed = transformToStreamlined(message)
@@ -1947,9 +1952,15 @@ function runHeadlessStreaming(
           // side effects or orphanedPermission state, so they process singly.
           // Prompt commands greedily collect followers with matching workload.
           const batch: QueuedCommand[] = [command]
-          if (command.mode === 'prompt') {
-            while (canBatchWith(command, peek(isMainThread))) {
+          if (command.mode === 'prompt' && !isSlashCommand(command)) {
+            let nextCommand = peek(isMainThread)
+            while (
+              nextCommand !== undefined &&
+              canBatchWith(command, nextCommand) &&
+              !isSlashCommand(nextCommand)
+            ) {
               batch.push(dequeue(isMainThread)!)
+              nextCommand = peek(isMainThread)
             }
             if (batch.length > 1) {
               command = {
@@ -5200,6 +5211,8 @@ function getStructuredIO(
   inputPrompt: string | AsyncIterable<string>,
   options: {
     sdkUrl: string | undefined
+    im?: 'feishu'
+    imChatId?: string
     replayUserMessages?: boolean
   },
 ): StructuredIO {
@@ -5226,10 +5239,30 @@ function getStructuredIO(
     inputStream = inputPrompt
   }
 
-  // Use RemoteIO if sdkUrl is provided, otherwise use regular StructuredIO
-  return options.sdkUrl
-    ? new RemoteIO(options.sdkUrl, inputStream, options.replayUserMessages)
-    : new StructuredIO(inputStream, options.replayUserMessages)
+  if (options.sdkUrl) {
+    return new RemoteIO(options.sdkUrl, inputStream, options.replayUserMessages)
+  }
+
+  if (options.im === 'feishu') {
+    return new ImIO(
+      inputStream,
+      {
+        feishu: {
+          appId: process.env.FEISHU_APP_ID ?? '',
+          appSecret: process.env.FEISHU_APP_SECRET ?? '',
+          receiveId: options.imChatId ?? process.env.FEISHU_RECEIVE_ID ?? '',
+          receiveIdType:
+            (process.env.FEISHU_RECEIVE_ID_TYPE as
+              | FeishuReceiveIdType
+              | undefined) ?? 'chat_id',
+          baseUrl: process.env.FEISHU_BASE_URL,
+        },
+      },
+      options.replayUserMessages,
+    )
+  }
+
+  return new StructuredIO(inputStream, options.replayUserMessages)
 }
 
 /**

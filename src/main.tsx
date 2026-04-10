@@ -192,6 +192,7 @@ import { shouldEnablePromptSuggestion } from './services/PromptSuggestion/prompt
 import { type AppState, getDefaultAppState, IDLE_SPECULATION_STATE } from './state/AppStateStore.js';
 import { onChangeAppState } from './state/onChangeAppState.js';
 import { createStore } from './state/store.js';
+import { getCliCommands } from './cli/commands/index.js';
 import { asSessionId } from './types/ids.js';
 import { filterAllowedSdkBetas } from './utils/betas.js';
 import { isInBundledMode, isRunningWithBun } from './utils/bundledMode.js';
@@ -979,7 +980,7 @@ async function run(): Promise<CommanderCommand> {
       throw new Error('--task-budget must be a positive integer');
     }
     return tokens;
-  }).hideHelp()).option('--replay-user-messages', 'Re-emit user messages from stdin back on stdout for acknowledgment (only works with --input-format=stream-json and --output-format=stream-json)', () => true).addOption(new Option('--enable-auth-status', 'Enable auth status messages in SDK mode').default(false).hideHelp()).option('--allowedTools, --allowed-tools <tools...>', 'Comma or space-separated list of tool names to allow (e.g. "Bash(git:*) Edit")').option('--tools <tools...>', 'Specify the list of available tools from the built-in set. Use "" to disable all tools, "default" to use all tools, or specify tool names (e.g. "Bash,Edit,Read").').option('--disallowedTools, --disallowed-tools <tools...>', 'Comma or space-separated list of tool names to deny (e.g. "Bash(git:*) Edit")').option('--mcp-config <configs...>', 'Load MCP servers from JSON files or strings (space-separated)').addOption(new Option('--permission-prompt-tool <tool>', 'MCP tool to use for permission prompts (only works with --print)').argParser(String).hideHelp()).addOption(new Option('--system-prompt <prompt>', 'System prompt to use for the session').argParser(String)).addOption(new Option('--system-prompt-file <file>', 'Read system prompt from a file').argParser(String).hideHelp()).addOption(new Option('--append-system-prompt <prompt>', 'Append a system prompt to the default system prompt').argParser(String)).addOption(new Option('--append-system-prompt-file <file>', 'Read system prompt from a file and append to the default system prompt').argParser(String).hideHelp()).addOption(new Option('--permission-mode <mode>', 'Permission mode to use for the session').argParser(String).choices(PERMISSION_MODES)).option('-c, --continue', 'Continue the most recent conversation in the current directory', () => true).option('-r, --resume [value]', 'Resume a conversation by session ID, or open interactive picker with optional search term', value => value || true).option('--fork-session', 'When resuming, create a new session ID instead of reusing the original (use with --resume or --continue)', () => true).addOption(new Option('--prefill <text>', 'Pre-fill the prompt input with text without submitting it').hideHelp()).addOption(new Option('--deep-link-origin', 'Signal that this session was launched from a deep link').hideHelp()).addOption(new Option('--deep-link-repo <slug>', 'Repo slug the deep link ?repo= parameter resolved to the current cwd').hideHelp()).addOption(new Option('--deep-link-last-fetch <ms>', 'FETCH_HEAD mtime in epoch ms, precomputed by the deep link trampoline').argParser(v => {
+  }).hideHelp()).option('--replay-user-messages', 'Re-emit user messages from stdin back on stdout for acknowledgment (only works with --input-format=stream-json and --output-format=stream-json)', () => true).addOption(new Option('--enable-auth-status', 'Enable auth status messages in SDK mode').default(false).hideHelp()).addOption(new Option('--im <provider>', 'Send headless stream output to an IM provider').choices(['feishu'])).option('--im_chat_id <chatId>', 'Feishu receive chat_id for --im feishu').option('--allowedTools, --allowed-tools <tools...>', 'Comma or space-separated list of tool names to allow (e.g. "Bash(git:*) Edit")').option('--tools <tools...>', 'Specify the list of available tools from the built-in set. Use "" to disable all tools, "default" to use all tools, or specify tool names (e.g. "Bash,Edit,Read").').option('--disallowedTools, --disallowed-tools <tools...>', 'Comma or space-separated list of tool names to deny (e.g. "Bash(git:*) Edit")').option('--mcp-config <configs...>', 'Load MCP servers from JSON files or strings (space-separated)').addOption(new Option('--permission-prompt-tool <tool>', 'MCP tool to use for permission prompts (only works with --print)').argParser(String).hideHelp()).addOption(new Option('--system-prompt <prompt>', 'System prompt to use for the session').argParser(String)).addOption(new Option('--system-prompt-file <file>', 'Read system prompt from a file').argParser(String).hideHelp()).addOption(new Option('--append-system-prompt <prompt>', 'Append a system prompt to the default system prompt').argParser(String)).addOption(new Option('--append-system-prompt-file <file>', 'Read system prompt from a file and append to the default system prompt').argParser(String).hideHelp()).addOption(new Option('--permission-mode <mode>', 'Permission mode to use for the session').argParser(String).choices(PERMISSION_MODES)).option('-c, --continue', 'Continue the most recent conversation in the current directory', () => true).option('-r, --resume [value]', 'Resume a conversation by session ID, or open interactive picker with optional search term', value => value || true).option('--fork-session', 'When resuming, create a new session ID instead of reusing the original (use with --resume or --continue)', () => true).addOption(new Option('--prefill <text>', 'Pre-fill the prompt input with text without submitting it').hideHelp()).addOption(new Option('--deep-link-origin', 'Signal that this session was launched from a deep link').hideHelp()).addOption(new Option('--deep-link-repo <slug>', 'Repo slug the deep link ?repo= parameter resolved to the current cwd').hideHelp()).addOption(new Option('--deep-link-last-fetch <ms>', 'FETCH_HEAD mtime in epoch ms, precomputed by the deep link trampoline').argParser(v => {
     const n = Number(v);
     return Number.isFinite(n) ? n : undefined;
   }).hideHelp()).option('--from-pr [value]', 'Resume a session linked to a PR by PR number/URL, or open interactive picker with optional search term', value => value || true).option('--no-session-persistence', 'Disable session persistence - sessions will not be saved to disk and cannot be resumed (only works with --print)').addOption(new Option('--resume-session-at <message id>', 'When resuming, only messages up to and including the assistant message with <message.id> (use with --resume in print mode)').argParser(String).hideHelp()).addOption(new Option('--rewind-files <user-message-id>', 'Restore files to state at the specified user message and exit (requires --resume)').hideHelp())
@@ -1215,6 +1216,15 @@ async function run(): Promise<CommanderCommand> {
     const sdkUrl = (options as {
       sdkUrl?: string;
     }).sdkUrl ?? undefined;
+    const im = (options as {
+      im?: 'feishu';
+    }).im ?? undefined;
+    const imChatId = (options as {
+      imChatId?: string;
+      im_chat_id?: string;
+    }).imChatId ?? (options as {
+      im_chat_id?: string;
+    }).im_chat_id ?? undefined;
 
     // Allow env var to enable partial messages (used by sandbox gateway for baku)
     const effectiveIncludePartialMessages = includePartialMessages || isEnvTruthy(process.env.CLAUDE_CODE_INCLUDE_PARTIAL_MESSAGES);
@@ -1240,6 +1250,17 @@ async function run(): Promise<CommanderCommand> {
         verbose = true;
       }
       // Auto-enable print mode unless explicitly disabled
+      if (!options.print) {
+        print = true;
+      }
+    }
+    if (im) {
+      if (!outputFormat) {
+        outputFormat = 'stream-json';
+      }
+      if (options.verbose === undefined) {
+        verbose = true;
+      }
       if (!options.print) {
         print = true;
       }
@@ -1819,6 +1840,16 @@ async function run(): Promise<CommanderCommand> {
       console.error(`Error: --input-format=stream-json requires output-format=stream-json.`);
       process.exit(1);
     }
+    if (im && outputFormat !== 'stream-json') {
+      // biome-ignore lint/suspicious/noConsole:: intentional console output
+      console.error(`Error: --im requires --output-format=stream-json.`);
+      process.exit(1);
+    }
+    if (im === 'feishu' && !imChatId) {
+      // biome-ignore lint/suspicious/noConsole:: intentional console output
+      console.error(`Error: --im feishu requires --im_chat_id.`);
+      process.exit(1);
+    }
 
     // Validate sdkUrl is only used with appropriate formats (formats are auto-set above)
     if (sdkUrl) {
@@ -1827,6 +1858,11 @@ async function run(): Promise<CommanderCommand> {
         console.error(`Error: --sdk-url requires both --input-format=stream-json and --output-format=stream-json.`);
         process.exit(1);
       }
+    }
+    if (im && sdkUrl) {
+      // biome-ignore lint/suspicious/noConsole:: intentional console output
+      console.error(`Error: --im is not supported together with --sdk-url.`);
+      process.exit(1);
     }
 
     // Validate replayUserMessages is only used with stream-json formats
@@ -2608,7 +2644,24 @@ async function run(): Promise<CommanderCommand> {
 
       // Headless mode supports all prompt commands and some local commands
       // If disableSlashCommands is true, return empty array
-      const commandsHeadless = disableSlashCommands ? [] : commands.filter(command => command.type === 'prompt' && !command.disableNonInteractive || command.type === 'local' && command.supportsNonInteractive);
+      const cliCommands = im === 'feishu' ? getCliCommands('feishu') : [];
+      const commandsHeadless = disableSlashCommands ? [] : uniqBy(
+        [
+          ...commands.filter(
+            command =>
+              (
+                command.type === 'prompt' &&
+                !command.disableNonInteractive
+              ) ||
+              (
+                command.type === 'local' &&
+                command.supportsNonInteractive
+              ),
+          ),
+          ...cliCommands,
+        ],
+        'name',
+      );
       const defaultState = getDefaultAppState();
       const headlessInitialState: AppState = {
         ...defaultState,
@@ -2820,6 +2873,8 @@ async function run(): Promise<CommanderCommand> {
         resume: options.resume,
         verbose: verbose,
         outputFormat: outputFormat,
+        im,
+        imChatId,
         jsonSchema,
         permissionPromptToolName: options.permissionPromptTool,
         allowedTools,
