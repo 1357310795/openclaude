@@ -13,6 +13,8 @@
   ],
   "scripts": {
     "build": "bun run scripts/build.ts",
+    "generate:types": "bun run scripts/generate-types.ts",
+    "generate:control-types": "bun run scripts/generate-types.ts",
     "dev": "bun run build && node dist/cli.mjs",
     "dev:profile": "bun run scripts/provider-launch.ts",
     "dev:profile:fast": "bun run scripts/provider-launch.ts auto --fast --bare",

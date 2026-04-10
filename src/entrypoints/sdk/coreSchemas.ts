@@ -4,7 +4,7 @@
  * These schemas are the single source of truth for SDK data types.
  * TypeScript types are generated from these schemas and committed for IDE support.
  *
- * @see scripts/generate-sdk-types.ts for type generation
+ * @see scripts/generate-types.ts for type generation
  */
 
 import { z } from 'zod/v4'
