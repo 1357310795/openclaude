@@ -80,6 +80,32 @@ function isGithubModelsMode(): boolean {
   return isEnvTruthy(process.env.CLAUDE_CODE_USE_GITHUB)
 }
 
+function filterAnthropicHeaders(
+  headers: Record<string, string> | undefined,
+): Record<string, string> {
+  if (!headers) return {}
+
+  const filtered: Record<string, string> = {}
+  for (const [key, value] of Object.entries(headers)) {
+    const lower = key.toLowerCase()
+    if (
+      lower.startsWith('x-anthropic') ||
+      lower.startsWith('anthropic-') ||
+      lower.startsWith('x-claude') ||
+      lower === 'x-app' ||
+      lower === 'x-client-app' ||
+      lower === 'authorization' ||
+      lower === 'x-api-key' ||
+      lower === 'api-key'
+    ) {
+      continue
+    }
+    filtered[key] = value
+  }
+
+  return filtered
+}
+
 function hasGeminiApiHost(baseUrl: string | undefined): boolean {
   if (!baseUrl) return false
 
@@ -538,11 +564,14 @@ function convertChunkUsage(
 ): Partial<AnthropicUsage> | undefined {
   if (!usage) return undefined
 
+  const cached = usage.prompt_tokens_details?.cached_tokens ?? 0
   return {
-    input_tokens: usage.prompt_tokens ?? 0,
+    // Subtract cached tokens: OpenAI includes them in prompt_tokens,
+    // but Anthropic convention treats input_tokens as non-cached only.
+    input_tokens: (usage.prompt_tokens ?? 0) - cached,
     output_tokens: usage.completion_tokens ?? 0,
     cache_creation_input_tokens: 0,
-    cache_read_input_tokens: usage.prompt_tokens_details?.cached_tokens ?? 0,
+    cache_read_input_tokens: cached,
   }
 }
 
@@ -989,7 +1018,7 @@ class OpenAIShimMessages {
   private providerOverride?: { model: string; baseURL: string; apiKey: string }
 
   constructor(defaultHeaders: Record<string, string>, reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh', providerOverride?: { model: string; baseURL: string; apiKey: string }) {
-    this.defaultHeaders = defaultHeaders
+    this.defaultHeaders = filterAnthropicHeaders(defaultHeaders)
     this.reasoningEffort = reasoningEffort
     this.providerOverride = providerOverride
   }
@@ -1099,7 +1128,7 @@ class OpenAIShimMessages {
         params,
         defaultHeaders: {
           ...this.defaultHeaders,
-          ...(options?.headers ?? {}),
+          ...filterAnthropicHeaders(options?.headers),
           ...COPILOT_HEADERS,
         },
         signal: options?.signal,
@@ -1131,7 +1160,7 @@ class OpenAIShimMessages {
         params,
         defaultHeaders: {
           ...this.defaultHeaders,
-          ...(options?.headers ?? {}),
+          ...filterAnthropicHeaders(options?.headers),
         },
         signal: options?.signal,
       })
@@ -1158,6 +1187,7 @@ class OpenAIShimMessages {
       model: request.resolvedModel,
       messages: openaiMessages,
       stream: params.stream ?? false,
+      store: false,
     }
     // Convert max_tokens to max_completion_tokens for OpenAI API compatibility.
     // Azure OpenAI requires max_completion_tokens and does not accept max_tokens.
@@ -1223,7 +1253,7 @@ class OpenAIShimMessages {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       ...this.defaultHeaders,
-      ...(options?.headers ?? {}),
+      ...filterAnthropicHeaders(options?.headers),
     }
 
     const isGemini = isGeminiMode()
@@ -1332,6 +1362,7 @@ class OpenAIShimMessages {
               }>,
             ),
             stream: params.stream ?? false,
+            store: false,
           }
 
           if (!Array.isArray(responsesBody.input) || responsesBody.input.length === 0) {
