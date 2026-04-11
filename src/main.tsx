@@ -1310,8 +1310,10 @@ async function run(): Promise<CommanderCommand> {
 
         // Check if session ID already exists
         if (sessionIdExists(validatedSessionId)) {
-          process.stderr.write(chalk.red(`Error: Session ID ${validatedSessionId} is already in use.\n`));
-          process.exit(1);
+          // process.stderr.write(chalk.red(`Error: Session ID ${validatedSessionId} is already in use.\n`));
+          // process.exit(1);
+          options.resume = sessionId
+          options.sessionId = undefined
         }
       }
     }
@@ -2872,6 +2874,7 @@ async function run(): Promise<CommanderCommand> {
         continue: options.continue,
         resume: options.resume,
         verbose: verbose,
+        inputFormat: inputFormat,
         outputFormat: outputFormat,
         im,
         imChatId,

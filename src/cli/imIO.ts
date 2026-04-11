@@ -1,5 +1,7 @@
 import * as Lark from '@larksuiteoapi/node-sdk'
 import { randomUUID } from 'crypto'
+import type { Interface as ReadLineInterface } from 'readline'
+import { createInterface } from 'readline'
 import { PassThrough } from 'stream'
 import type { SDKUserMessage } from 'src/entrypoints/agentSdkTypes.js'
 import type { StdoutMessage } from 'src/entrypoints/sdk/controlTypes.js'
@@ -125,8 +127,10 @@ export const createLarkWsClient = (config: ImIOConfig): Lark.WSClient =>
 export class ImIO extends StructuredIO {
   private readonly config: ImIOConfig
   private readonly inputStream: PassThrough
+  private readonly useStdinEventInput: boolean
   private client: Lark.Client | null = null
   private wsClient: Lark.WSClient | null = null
+  private stdinEventReader: ReadLineInterface | null = null
   private receiverStartPromise: Promise<void> | null = null
   private inputEnded = false
   private closed = false
@@ -141,14 +145,18 @@ export class ImIO extends StructuredIO {
     input: AsyncIterable<string>,
     config: ImIOConfig,
     replayUserMessages?: boolean,
+    inputFormat?: string | undefined,
   ) {
     const inputStream = new PassThrough({ encoding: 'utf8' })
     super(inputStream, replayUserMessages)
     this.config = config
     this.inputStream = inputStream
+    this.useStdinEventInput = inputFormat === 'stream-json'
 
     registerCleanup(async () => this.close())
-    void this.forwardInitialPrompt(input)
+    if (!this.useStdinEventInput) {
+      void this.forwardInitialPrompt(input)
+    }
 
     if (config.autoStartReceiver !== false) {
       void this.startReceiver().catch(() => {})
@@ -197,6 +205,7 @@ export class ImIO extends StructuredIO {
         this.handleError(error)
       })
     }
+    this.stdinEventReader?.close()
     this.wsClient?.close()
     this.endInput()
     this.log('ImIO closed')
@@ -263,8 +272,9 @@ export class ImIO extends StructuredIO {
     }
 
     this.receiverStartPromise = this.startReceiverInternal().catch(error => {
-      this.log('Feishu receiver failed to start', {
+      this.log('Feishu inbound source failed to start', {
         error: error instanceof Error ? error.message : String(error),
+        source: this.useStdinEventInput ? 'stdin' : 'receiver',
       })
       this.handleError(error)
       this.endInput()
@@ -275,6 +285,11 @@ export class ImIO extends StructuredIO {
   }
 
   private async startReceiverInternal(): Promise<void> {
+    if (this.useStdinEventInput) {
+      await this.startStdinEventReader()
+      return
+    }
+
     this.validateConfig()
     await this.getLarkWsClient().start({
       eventDispatcher: this.createEventDispatcher(),
@@ -290,6 +305,46 @@ export class ImIO extends StructuredIO {
         await this.handleFeishuMessageEvent(event)
       },
     })
+  }
+
+  private async startStdinEventReader(): Promise<void> {
+    process.stdin.setEncoding('utf8')
+    const reader = createInterface({
+      input: process.stdin,
+      crlfDelay: Infinity,
+    })
+    this.stdinEventReader = reader
+    this.log('Feishu stdin event reader started')
+
+    try {
+      for await (const rawLine of reader) {
+        if (this.closed) {
+          return
+        }
+
+        const line = rawLine.trim()
+        if (line === '') {
+          continue
+        }
+
+        await this.handleFeishuMessageEvent(this.parseFeishuStdinEvent(line))
+      }
+    } finally {
+      if (this.stdinEventReader === reader) {
+        this.stdinEventReader = null
+      }
+      this.endInput()
+      this.log('Feishu stdin event reader stopped')
+    }
+  }
+
+  protected parseFeishuStdinEvent(line: string): FeishuMessageReceiveEvent {
+    try {
+      return JSON.parse(line) as FeishuMessageReceiveEvent
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      throw new Error(`Failed to parse Feishu stdin event JSON: ${detail}`)
+    }
   }
 
   private async forwardInitialPrompt(

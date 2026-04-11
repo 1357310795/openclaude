@@ -467,6 +467,7 @@ export async function runHeadless(
     resume: string | boolean | undefined
     resumeSessionAt: string | undefined
     verbose: boolean | undefined
+    inputFormat: string | undefined
     outputFormat: string | undefined
     im: 'feishu' | undefined
     imChatId?: string | undefined
@@ -5213,7 +5214,8 @@ function getStructuredIO(
     sdkUrl: string | undefined
     im?: 'feishu'
     imChatId?: string
-    replayUserMessages?: boolean
+    replayUserMessages?: boolean,
+    inputFormat: string | undefined
   },
 ): StructuredIO {
   let inputStream: AsyncIterable<string>
@@ -5259,6 +5261,7 @@ function getStructuredIO(
         },
       },
       options.replayUserMessages,
+      options.inputFormat
     )
   }
 
