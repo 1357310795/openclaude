@@ -4,7 +4,11 @@ import type { Interface as ReadLineInterface } from 'readline'
 import { createInterface } from 'readline'
 import { PassThrough } from 'stream'
 import type { SDKUserMessage } from 'src/entrypoints/agentSdkTypes.js'
-import type { StdoutMessage } from 'src/entrypoints/sdk/controlTypes.js'
+import type {
+  SDKControlRequest,
+  StdoutMessage,
+} from 'src/entrypoints/sdk/controlTypes.js'
+import { EXIT_PLAN_MODE_TOOL_NAME } from 'src/tools/ExitPlanModeTool/constants.js'
 import { registerCleanup } from '../utils/cleanupRegistry.js'
 import { jsonStringify } from '../utils/slowOperations.js'
 import { StructuredIO } from './structuredIO.js'
@@ -60,6 +64,7 @@ export type FeishuMessageReceiveEvent = {
 }
 
 const MAX_RECENT_INBOUND_MESSAGE_IDS = 1000
+const FEISHU_COMPACT_TOOL_CALL_DISPLAY = true
 const FEISHU_STREAM_ELEMENT_ID = 'assistant_stream'
 const TOOL_CARD_META_ELEMENT_ID = 'tool_meta'
 const TOOL_CARD_STATUS_ELEMENT_ID = 'tool_status'
@@ -72,6 +77,10 @@ type SDKResultMessage = Extract<StdoutMessage, { type: 'result' }>
 type SDKSystemInitMessage = Extract<
   StdoutMessage,
   { type: 'system'; subtype: 'init' }
+>
+type SDKSystemStatusMessage = Extract<
+  StdoutMessage,
+  { type: 'system'; subtype: 'status' }
 >
 type SDKToolProgressMessage = Extract<StdoutMessage, { type: 'tool_progress' }>
 type SDKUserOutputMessage = Extract<StdoutMessage, { type: 'user' }>
@@ -104,6 +113,25 @@ type ToolCardState = {
   resultElementCreated: boolean
   finalized: boolean
   lastStatus: string
+}
+
+type CompactToolCardState = {
+  cardId: string
+  messageId: string
+  sequence: number
+  total: number
+  completed: number
+  failed: number
+  seenToolUseIds: Set<string>
+  finalizedToolUseIds: Set<string>
+}
+
+type PendingPlanApproval = {
+  requestId: string
+  toolUseId: string
+  plan: string
+  planFilePath: string
+  description: string
 }
 
 export const larkClient = (config: ImIOConfig): Lark.Client =>
@@ -140,6 +168,8 @@ export class ImIO extends StructuredIO {
   private readonly streamTextByBlockIndex = new Map<number, string>()
   private readonly toolUseIdByBlockIndex = new Map<number, string>()
   private readonly toolCardsByToolUseId = new Map<string, ToolCardState>()
+  private compactToolCard: CompactToolCardState | null = null
+  private pendingPlanApproval: PendingPlanApproval | null = null
 
   constructor(
     input: AsyncIterable<string>,
@@ -397,6 +427,12 @@ export class ImIO extends StructuredIO {
     return message.type === 'system' && message.subtype === 'init'
   }
 
+  protected isSdkSystemStatusMessage(
+    message: StdoutMessage,
+  ): message is SDKSystemStatusMessage {
+    return message.type === 'system' && message.subtype === 'status'
+  }
+
   protected isSdkToolProgressMessage(
     message: StdoutMessage,
   ): message is SDKToolProgressMessage {
@@ -407,6 +443,12 @@ export class ImIO extends StructuredIO {
     message: StdoutMessage,
   ): message is SDKUserOutputMessage {
     return message.type === 'user'
+  }
+
+  protected isSdkControlRequestMessage(
+    message: StdoutMessage,
+  ): message is SDKControlRequest {
+    return message.type === 'control_request'
   }
 
   protected isToolLifecycleSystemMessage(
@@ -423,6 +465,11 @@ export class ImIO extends StructuredIO {
   protected async tryHandleCardMessage(message: StdoutMessage): Promise<boolean> {
     if (this.isSdkSystemInitMessage(message)) {
       await this.handleSystemMessage(message)
+      return true
+    }
+
+    if (this.isSdkSystemStatusMessage(message)) {
+      await this.handleSystemStatusMessage(message)
       return true
     }
 
@@ -447,6 +494,10 @@ export class ImIO extends StructuredIO {
       return this.handleToolResultUserMessage(message)
     }
 
+    if (this.isSdkControlRequestMessage(message)) {
+      return this.handleControlRequestMessage(message)
+    }
+
     if (this.isSdkResultMessage(message)) {
       await this.handleResultMessage(message)
       return true
@@ -457,6 +508,25 @@ export class ImIO extends StructuredIO {
 
   protected buildSendRequest(message: StdoutMessage): FeishuSendMessageRequest {
     return this.buildTextSendRequest(this.buildFeishuText(message))
+  }
+
+  protected isExitPlanModeControlRequest(
+    message: SDKControlRequest,
+  ): message is SDKControlRequest & {
+    request: {
+      subtype: 'can_use_tool'
+      request_id?: never
+      tool_name: string
+      tool_use_id: string
+      input?: Record<string, unknown>
+      description?: string
+    }
+  } {
+    return (
+      message.request.subtype === 'can_use_tool' &&
+      message.request.tool_name === EXIT_PLAN_MODE_TOOL_NAME &&
+      typeof message.request.tool_use_id === 'string'
+    )
   }
 
   protected buildTextSendRequest(text: string): FeishuSendMessageRequest {
@@ -1060,11 +1130,153 @@ export class ImIO extends StructuredIO {
     return `**Status**: ${this.truncateCardText(status, 2000)}`
   }
 
+  protected buildPlanApprovalMarkdown(approval: PendingPlanApproval): string {
+    const lines = ['**计划审核**', approval.description || '请审核当前计划。']
+
+    if (approval.planFilePath !== '') {
+      lines.push(`**Plan File**: \`${this.escapeMarkdownInlineCode(approval.planFilePath)}\``)
+    }
+
+    if (approval.plan !== '') {
+      lines.push(this.buildCodeBlockMarkdown('Plan', approval.plan))
+    }
+
+    lines.push('回复 `/allow` 批准，回复 `/deny` 拒绝。')
+    return lines.join('\n\n')
+  }
+
+  protected buildStatusChangeCard(
+    message: SDKSystemStatusMessage,
+  ): Record<string, unknown> {
+    return {
+      schema: '2.0',
+      header: {
+        title: {
+          tag: 'plain_text',
+          content: '状态变化',
+        },
+      },
+      body: {
+        elements: [
+          {
+            tag: 'markdown',
+            content: this.buildStatusChangeMarkdown(message),
+          },
+        ],
+      },
+    }
+  }
+
+  protected buildStatusChangeMarkdown(message: SDKSystemStatusMessage): string {
+    const lines = ['**检测到状态变化**']
+
+    if (message.permissionMode) {
+      lines.push(
+        `**Permission Mode**: \`${this.escapeMarkdownInlineCode(message.permissionMode)}\``,
+      )
+    }
+
+    lines.push(
+      `**Status**: ${message.status === null ? '`null`' : `\`${this.escapeMarkdownInlineCode(message.status)}\``}`,
+    )
+
+    return lines.join('\n')
+  }
+
+  protected buildCompactToolCard(state: CompactToolCardState): Record<string, unknown> {
+    return {
+      schema: '2.0',
+      header: {
+        title: {
+          tag: 'plain_text',
+          content: 'Tool Calls',
+        },
+      },
+      body: {
+        elements: [
+          {
+            tag: 'markdown',
+            content: `${state.total}个工具调用，${state.completed}个已完成（${state.failed}个失败）`,
+          },
+        ],
+      },
+    }
+  }
+
+  protected async ensureCompactToolCard(): Promise<CompactToolCardState> {
+    if (this.compactToolCard) {
+      return this.compactToolCard
+    }
+
+    const { cardId, messageId } = await this.sendCard(
+      this.buildCompactToolCard({
+        cardId: '',
+        messageId: '',
+        sequence: 0,
+        total: 0,
+        completed: 0,
+        failed: 0,
+        seenToolUseIds: new Set<string>(),
+        finalizedToolUseIds: new Set<string>(),
+      }),
+    )
+
+    this.compactToolCard = {
+      cardId,
+      messageId,
+      sequence: 1,
+      total: 0,
+      completed: 0,
+      failed: 0,
+      finalizedToolUseIds: new Set<string>(),
+    }
+
+    return this.compactToolCard
+  }
+
+  protected async refreshCompactToolCard(): Promise<void> {
+    const state = this.compactToolCard
+    if (!state) {
+      return
+    }
+
+    await this.updateCardFull(
+      state.cardId,
+      this.buildCompactToolCard(state),
+      this.nextCardSequence(state),
+    )
+  }
+
   protected async startToolCard(
     blockIndex: number,
     toolUseId: string,
     toolName: string,
   ): Promise<void> {
+    if (FEISHU_COMPACT_TOOL_CALL_DISPLAY) {
+      this.toolUseIdByBlockIndex.set(blockIndex, toolUseId)
+      const state = await this.ensureCompactToolCard()
+      if (!state.seenToolUseIds.has(toolUseId)) {
+        state.seenToolUseIds.add(toolUseId)
+        state.total = state.seenToolUseIds.size
+        await this.refreshCompactToolCard()
+      }
+      this.toolCardsByToolUseId.set(toolUseId, {
+        isError: false,
+        toolUseId,
+        toolName,
+        blockIndex,
+        cardId: state.cardId,
+        messageId: state.messageId,
+        sequence: state.sequence,
+        inputJson: '',
+        resultText: '',
+        resultElementCreated: false,
+        finalized: false,
+        lastStatus: '_Preparing input..._',
+      })
+      return
+    }
+
     if (this.toolCardsByToolUseId.has(toolUseId)) {
       this.toolUseIdByBlockIndex.set(blockIndex, toolUseId)
       return
@@ -1108,6 +1320,11 @@ export class ImIO extends StructuredIO {
       return Boolean(state)
     }
 
+    state.lastStatus = status
+    if (FEISHU_COMPACT_TOOL_CALL_DISPLAY) {
+      return true
+    }
+
     await this.updateCardElement(
       state.cardId,
       TOOL_CARD_STATUS_ELEMENT_ID,
@@ -1118,7 +1335,6 @@ export class ImIO extends StructuredIO {
       },
       this.nextCardSequence(state),
     )
-    state.lastStatus = status
     return true
   }
 
@@ -1137,6 +1353,10 @@ export class ImIO extends StructuredIO {
     }
 
     state.inputJson += partialJson
+    await this.updateToolCardStatus(toolUseId, '_Receiving input..._')
+    if (FEISHU_COMPACT_TOOL_CALL_DISPLAY) {
+      return true
+    }
 
     await this.updateCardElement(
       state.cardId,
@@ -1152,7 +1372,6 @@ export class ImIO extends StructuredIO {
       },
       this.nextCardSequence(state),
     )
-    await this.updateToolCardStatus(toolUseId, '_Receiving input..._')
     return true
   }
 
@@ -1291,29 +1510,88 @@ export class ImIO extends StructuredIO {
     })
   }
 
+  protected async handleControlRequestMessage(
+    message: SDKControlRequest,
+  ): Promise<boolean> {
+    if (!this.isExitPlanModeControlRequest(message)) {
+      return false
+    }
+
+    const input = message.request.input ?? {}
+    this.pendingPlanApproval = {
+      requestId: message.request_id,
+      toolUseId: message.request.tool_use_id,
+      plan:
+        typeof input.plan === 'string' ? this.truncateCardText(input.plan, 8000) : '',
+      planFilePath:
+        typeof input.planFilePath === 'string' ? input.planFilePath : '',
+      description:
+        typeof message.request.description === 'string'
+          ? message.request.description
+          : 'OpenClaude 请求退出 plan mode，请审核计划。',
+    }
+
+    await this.sendFeishuMessage(
+      this.buildTextSendRequest(
+        this.buildPlanApprovalMarkdown(this.pendingPlanApproval),
+      ),
+    )
+    return true
+  }
+
   protected async updateToolResultCard(
     toolUseId: string,
     resultText: string,
     isError: boolean,
   ): Promise<boolean> {
-    const state = this.toolCardsByToolUseId.get(toolUseId)
-    if (!state) {
-      return false
+    if (FEISHU_COMPACT_TOOL_CALL_DISPLAY) {
+      const compactState = this.compactToolCard
+      if (!compactState) {
+        return true
+      }
+
+      let shouldRefresh = false
+      if (!compactState.seenToolUseIds.has(toolUseId)) {
+        compactState.seenToolUseIds.add(toolUseId)
+        compactState.total = compactState.seenToolUseIds.size
+        shouldRefresh = true
+      }
+
+      if (!compactState.finalizedToolUseIds.has(toolUseId)) {
+        compactState.finalizedToolUseIds.add(toolUseId)
+        compactState.completed += 1
+        if (isError) {
+          compactState.failed += 1
+        }
+        shouldRefresh = true
+      }
+
+      if (shouldRefresh) {
+        await this.refreshCompactToolCard()
+      }
+      return true
     }
+    else {
+      const state = this.toolCardsByToolUseId.get(toolUseId)
 
-    state.isError = isError
-    state.lastStatus = isError ? '_Failed_' : '_Completed_'
-    state.resultElementCreated = true
-    state.resultText = resultText
-    state.finalized = true
+      if (!state) {
+        return false
+      }
 
-    await this.updateCardFull(
-      state.cardId,
-      this.buildToolCardComplete(state),
-      this.nextCardSequence(state),
-    )
+      state.isError = isError
+      state.lastStatus = isError ? '_Failed_' : '_Completed_'
+      state.resultElementCreated = true
+      state.resultText = resultText
+      state.finalized = true
 
-    return true
+      await this.updateCardFull(
+        state.cardId,
+        this.buildToolCardComplete(state),
+        this.nextCardSequence(state),
+      )
+
+      return true
+    }
   }
 
   protected async handleToolResultUserMessage(
@@ -1321,7 +1599,7 @@ export class ImIO extends StructuredIO {
   ): Promise<boolean> {
     const toolResults = this.extractToolResultBlocks(message)
     if (toolResults.length === 0) {
-      return false
+      return true
     }
 
     let handled = false
@@ -1360,6 +1638,11 @@ export class ImIO extends StructuredIO {
     for (const state of this.toolCardsByToolUseId.values()) {
       await this.finalizeToolCard(state)
     }
+    if (FEISHU_COMPACT_TOOL_CALL_DISPLAY) {
+      await this.refreshCompactToolCard()
+      this.compactToolCard = null
+    }
+    this.pendingPlanApproval = null
     this.toolCardsByToolUseId.clear()
 
     if (finalText) {
@@ -1422,7 +1705,7 @@ export class ImIO extends StructuredIO {
         elements: [
           {
             "tag": "collapsible_panel",
-            "element_id": "custom_id", 
+            "element_id": "custom_id",
             "direction": "vertical",
             "vertical_spacing": "8px",
             "horizontal_spacing": "8px",
@@ -1461,6 +1744,21 @@ export class ImIO extends StructuredIO {
     this.log('Feishu system card created', {
       cardId,
       messageId,
+    })
+  }
+
+  protected async handleSystemStatusMessage(
+    message: SDKSystemStatusMessage,
+  ): Promise<void> {
+    const { cardId, messageId } = await this.sendCard(
+      this.buildStatusChangeCard(message),
+    )
+
+    this.log('Feishu system status card created', {
+      cardId,
+      messageId,
+      status: message.status,
+      permissionMode: message.permissionMode,
     })
   }
 
@@ -1522,6 +1820,10 @@ export class ImIO extends StructuredIO {
       return
     }
 
+    if (this.tryHandlePlanApprovalCommand(prompt.trim())) {
+      return
+    }
+
     this.enqueueUserMessage(prompt)
   }
 
@@ -1579,6 +1881,47 @@ export class ImIO extends StructuredIO {
     }
 
     return rawContent
+  }
+
+  protected tryHandlePlanApprovalCommand(content: string): boolean {
+    if (!this.pendingPlanApproval) {
+      return false
+    }
+
+    const behavior =
+      content === '/allow' ? 'allow' : content === '/deny' ? 'deny' : null
+    if (!behavior) {
+      return false
+    }
+
+    const approval = this.pendingPlanApproval
+    this.pendingPlanApproval = null
+    this.writeInputLine(
+      jsonStringify({
+        type: 'control_response',
+        response: {
+          subtype: behavior === 'allow' ? 'success' : 'error',
+          request_id: approval.requestId,
+          response: {
+            behavior,
+            ...(behavior === 'allow'
+              ? {}
+              : { error: 'Denied by user' }),
+            toolUseID: approval.toolUseId,
+          },
+        },
+      }) + '\n',
+    )
+    void this
+      .sendFeishuMessage(
+        this.buildTextSendRequest(
+          behavior === 'allow' ? '已批准计划审核。' : '已拒绝计划审核。',
+        ),
+      )
+      .catch(error => {
+        this.handleError(error)
+      })
+    return true
   }
 
   protected enqueueUserMessage(content: string): void {

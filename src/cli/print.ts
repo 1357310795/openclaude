@@ -805,7 +805,7 @@ export async function runHeadless(
   let filteredTools = [...tools, ...allowedMcpTools]
 
   // When using SDK URL, always use stdio permission prompting to delegate to the SDK
-  const effectivePermissionPromptToolName = options.sdkUrl
+  const effectivePermissionPromptToolName = options.sdkUrl || options.im
     ? 'stdio'
     : options.permissionPromptToolName
 
