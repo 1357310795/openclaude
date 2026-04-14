@@ -1966,15 +1966,20 @@ export class ImIO extends StructuredIO {
       jsonStringify({
         type: 'control_response',
         response: {
-          subtype: behavior === 'allow' ? 'success' : 'error',
+          subtype: 'success',
           request_id: approval.requestId,
-          response: {
-            behavior,
-            ...(behavior === 'allow'
-              ? {}
-              : { error: 'Denied by user' }),
-            toolUseID: approval.toolUseId,
-          },
+          response:
+            behavior === 'allow'
+              ? {
+                  behavior: 'allow',
+                  updatedInput: {},
+                  toolUseID: approval.toolUseId,
+                }
+              : {
+                  behavior: 'deny',
+                  message: 'Denied by user',
+                  toolUseID: approval.toolUseId,
+                },
         },
       }) + '\n',
     )
