@@ -9,6 +9,8 @@ import type {
   StdoutMessage,
 } from 'src/entrypoints/sdk/controlTypes.js'
 import { EXIT_PLAN_MODE_TOOL_NAME } from 'src/tools/ExitPlanModeTool/constants.js'
+import { TODO_WRITE_TOOL_NAME } from 'src/tools/TodoWriteTool/constants.js'
+import type { TodoList } from 'src/utils/todo/types.js'
 import { registerCleanup } from '../utils/cleanupRegistry.js'
 import { jsonStringify } from '../utils/slowOperations.js'
 import { StructuredIO } from './structuredIO.js'
@@ -116,12 +118,6 @@ type ToolCardState = {
   lastStatus: string
 }
 
-type CompactToolCardToolEntry = {
-  toolUseId: string
-  toolName: string
-  completed: boolean
-}
-
 type CompactToolCardState = {
   cardId: string
   messageId: string
@@ -129,9 +125,8 @@ type CompactToolCardState = {
   total: number
   completed: number
   failed: number
-  seenToolUseIds: Set<string>
   finalizedToolUseIds: Set<string>
-  tools: CompactToolCardToolEntry[]
+  toolUseIds: string[]
   closed: boolean
 }
 
@@ -228,7 +223,7 @@ export class ImIO extends StructuredIO {
       await this.sendFeishuMessage(request)
     } catch (error) {
       this.handleError(error, message)
-      throw error
+      //throw error
     }
   }
 
@@ -738,7 +733,7 @@ export class ImIO extends StructuredIO {
         await this.resetStreamingState()
         return
       case 'message_stop':
-        await this.finalizeStreamingCard()
+        this.streamTextByBlockIndex.clear()
         return
       case 'content_block_start': {
         const textBlockIndex = this.getTextBlockIndexFromStart(event)
@@ -780,19 +775,13 @@ export class ImIO extends StructuredIO {
           return
         }
 
-        if (this.streamTextByBlockIndex.has(blockIndex)) {
-          this.streamTextByBlockIndex.delete(blockIndex)
-          // await this.markStreamingCardReadyForFinalization(blockIndex)
-          return
-        }
-
         const toolUseId = this.toolUseIdByBlockIndex.get(blockIndex)
-        if (!toolUseId) {
-          return
+        if (toolUseId) {
+          this.toolUseIdByBlockIndex.delete(blockIndex)
+          await this.updateToolCardStatus(toolUseId, '_Running..._')
         }
 
-        this.toolUseIdByBlockIndex.delete(blockIndex)
-        await this.updateToolCardStatus(toolUseId, '_Running..._')
+        await this.finalizeStreamingCard()
         return
       }
       default:
@@ -1026,18 +1015,8 @@ export class ImIO extends StructuredIO {
     return true
   }
 
-  // protected async markStreamingCardReadyForFinalization(
-  //   blockIndex: number,
-  // ): Promise<void> {
-  //   if (!this.activeCard || this.activeCard.blockIndex !== blockIndex) {
-  //     return
-  //   }
-
-  //   this.activeCard.finalized = true
-  // }
-
   protected async finalizeStreamingCard(): Promise<void> {
-    if (!this.activeCard || !this.activeCard.finalized) {
+    if (!this.activeCard || this.activeCard.finalized) {
       return
     }
 
@@ -1206,8 +1185,9 @@ export class ImIO extends StructuredIO {
   }
 
   protected buildCompactToolCard(state: CompactToolCardState): Record<string, unknown> {
-    const pendingTools = state.tools.filter(tool => !tool.completed)
-    const completedTools = state.tools.filter(tool => tool.completed)
+    const curTools = state.toolUseIds.map(id => this.toolCardsByToolUseId.get(id)!)
+    const pendingTools = curTools.filter(tool => !tool.finalized)
+    const completedTools = curTools.filter(tool => tool.finalized)
     const visibleCompletedTools = pendingTools.length >= 2 ? [] : completedTools.slice(-2 + pendingTools.length)
     const visibleTools = [...pendingTools, ...visibleCompletedTools]
     const hiddenCompletedCount = completedTools.length - visibleCompletedTools.length
@@ -1218,7 +1198,7 @@ export class ImIO extends StructuredIO {
     }
 
     visibleTools.forEach(tool => {
-      lines.push(`- ${this.escapeMarkdownInlineCode(tool.toolName)} _${tool.completed ? 'Completed' : 'Running'}_`)
+      lines.push(`- ${this.escapeMarkdownInlineCode(tool.toolName)} ${tool.lastStatus}`)
     })
 
     if (state.closed && lines.length === 0) {
@@ -1257,9 +1237,8 @@ export class ImIO extends StructuredIO {
         total: 0,
         completed: 0,
         failed: 0,
-        seenToolUseIds: new Set<string>(),
         finalizedToolUseIds: new Set<string>(),
-        tools: [],
+        toolUseIds: [],
         closed: false,
       }),
     )
@@ -1271,9 +1250,8 @@ export class ImIO extends StructuredIO {
       total: 0,
       completed: 0,
       failed: 0,
-      seenToolUseIds: new Set<string>(),
       finalizedToolUseIds: new Set<string>(),
-      tools: [],
+      toolUseIds: [],
       closed: false,
     }
 
@@ -1322,30 +1300,25 @@ export class ImIO extends StructuredIO {
     if (FEISHU_COMPACT_TOOL_CALL_DISPLAY) {
       this.toolUseIdByBlockIndex.set(blockIndex, toolUseId)
       const state = await this.ensureOpenCompactToolCard()
-      if (!state.seenToolUseIds.has(toolUseId)) {
-        state.seenToolUseIds.add(toolUseId)
-        state.total = state.seenToolUseIds.size
-        state.tools.push({
+      if (!state.toolUseIds.includes(toolUseId)) {
+        state.total = state.toolUseIds.length
+        state.toolUseIds.push(toolUseId)
+        this.toolCardsByToolUseId.set(toolUseId, {
+          isError: false,
           toolUseId,
           toolName,
-          completed: false,
+          blockIndex,
+          cardId: state.cardId,
+          messageId: state.messageId,
+          sequence: state.sequence,
+          inputJson: '',
+          resultText: '',
+          resultElementCreated: false,
+          finalized: false,
+          lastStatus: '_Preparing input..._',
         })
         await this.refreshCompactToolCard()
       }
-      this.toolCardsByToolUseId.set(toolUseId, {
-        isError: false,
-        toolUseId,
-        toolName,
-        blockIndex,
-        cardId: state.cardId,
-        messageId: state.messageId,
-        sequence: state.sequence,
-        inputJson: '',
-        resultText: '',
-        resultElementCreated: false,
-        finalized: false,
-        lastStatus: '_Preparing input..._',
-      })
       return
     }
 
@@ -1394,6 +1367,7 @@ export class ImIO extends StructuredIO {
 
     state.lastStatus = status
     if (FEISHU_COMPACT_TOOL_CALL_DISPLAY) {
+      await this.refreshCompactToolCard()
       return true
     }
 
@@ -1425,26 +1399,31 @@ export class ImIO extends StructuredIO {
     }
 
     state.inputJson += partialJson
-    await this.updateToolCardStatus(toolUseId, '_Receiving input..._')
+
+    if (state.lastStatus != "_Receiving input..._") {
+      await this.updateToolCardStatus(toolUseId, '_Receiving input..._')
+    }
+
     if (FEISHU_COMPACT_TOOL_CALL_DISPLAY) {
       return true
     }
-
-    await this.updateCardElement(
-      state.cardId,
-      TOOL_CARD_INPUT_ELEMENT_ID,
-      {
-        tag: 'markdown',
-        content: this.buildCodeBlockMarkdown(
-                  'Input',
-                  this.formatJsonPreview(state.inputJson) || '{}',
-                  'json',
-                ),
-        element_id: TOOL_CARD_INPUT_ELEMENT_ID,
-      },
-      this.nextCardSequence(state),
-    )
-    return true
+    else {
+      await this.updateCardElement(
+        state.cardId,
+        TOOL_CARD_INPUT_ELEMENT_ID,
+        {
+          tag: 'markdown',
+          content: this.buildCodeBlockMarkdown(
+                    'Input',
+                    this.formatJsonPreview(state.inputJson) || '{}',
+                    'json',
+                  ),
+          element_id: TOOL_CARD_INPUT_ELEMENT_ID,
+        },
+        this.nextCardSequence(state),
+      )
+      return true
+    }
   }
 
   protected async handleToolProgressMessage(
@@ -1616,56 +1595,28 @@ export class ImIO extends StructuredIO {
     resultText: string,
     isError: boolean,
   ): Promise<boolean> {
+    const state = this.toolCardsByToolUseId.get(toolUseId)
+
+    if (!state) {
+      return false
+    }
+
+    state.isError = isError
+    state.lastStatus = isError ? '_Failed_' : '_Completed_'
+    state.resultElementCreated = true
+    state.resultText = resultText
+    state.finalized = true
+
     if (FEISHU_COMPACT_TOOL_CALL_DISPLAY) {
-      const compactState = this.compactToolCard
-      if (!compactState) {
-        return true
-      }
-
-      let shouldRefresh = false
-      if (!compactState.seenToolUseIds.has(toolUseId)) {
-        compactState.seenToolUseIds.add(toolUseId)
-        compactState.total = compactState.seenToolUseIds.size
-        shouldRefresh = true
-      }
-
-      if (!compactState.finalizedToolUseIds.has(toolUseId)) {
-        compactState.finalizedToolUseIds.add(toolUseId)
-        compactState.completed += 1
-        if (isError) {
-          compactState.failed += 1
-        }
-        const tool = compactState.tools.find(entry => entry.toolUseId === toolUseId)
-        if (tool) {
-          tool.completed = true
-        }
-        shouldRefresh = true
-      }
-
-      if (shouldRefresh) {
-        await this.refreshCompactToolCard()
-      }
+      await this.refreshCompactToolCard()
       return true
     }
     else {
-      const state = this.toolCardsByToolUseId.get(toolUseId)
-
-      if (!state) {
-        return false
-      }
-
-      state.isError = isError
-      state.lastStatus = isError ? '_Failed_' : '_Completed_'
-      state.resultElementCreated = true
-      state.resultText = resultText
-      state.finalized = true
-
       await this.updateCardFull(
         state.cardId,
         this.buildToolCardComplete(state),
         this.nextCardSequence(state),
       )
-
       return true
     }
   }
@@ -1688,7 +1639,7 @@ export class ImIO extends StructuredIO {
       handled = updated || handled
     }
 
-    return handled
+    return true//handled
   }
 
   protected async finalizeToolCard(state: ToolCardState): Promise<void> {
@@ -1707,7 +1658,7 @@ export class ImIO extends StructuredIO {
       this.activeCard = null
       await this.deleteStreamingCard(card)
     }
-    if (FEISHU_COMPACT_TOOL_CALL_DISPLAY) {
+    if (!this.hasToolUseContent(message) && texts.length > 0 && FEISHU_COMPACT_TOOL_CALL_DISPLAY) {
       await this.closeCompactToolCard()
     }
 
@@ -1736,8 +1687,23 @@ export class ImIO extends StructuredIO {
       .map(block => block.text)
   }
 
+  protected hasToolUseContent(message: SDKAssistantMessage): boolean {
+    const content = message.message?.content
+    if (!Array.isArray(content)) {
+      return false
+    }
+
+    return content
+      .some(
+        (block): block is { type: 'tool_use' } =>
+          !!block &&
+          typeof block === 'object' &&
+          'type' in block &&
+          block.type === 'tool_use',
+      )
+  }
+
   protected async handleResultMessage(message: SDKResultMessage): Promise<void> {
-    this.streamTextByBlockIndex.clear()
     this.toolUseIdByBlockIndex.clear()
 
     for (const state of this.toolCardsByToolUseId.values()) {
