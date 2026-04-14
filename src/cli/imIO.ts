@@ -118,6 +118,13 @@ type ToolCardState = {
   lastStatus: string
 }
 
+type TodoListCardState = {
+  cardId: string
+  messageId: string
+  sequence: number
+  todoList: TodoList | null
+}
+
 type CompactToolCardState = {
   cardId: string
   messageId: string
@@ -174,6 +181,7 @@ export class ImIO extends StructuredIO {
   private readonly toolCardsByToolUseId = new Map<string, ToolCardState>()
   private compactToolCard: CompactToolCardState | null = null
   private pendingPlanApproval: PendingPlanApproval | null = null
+  private todoListCard: TodoListCardState | null = null
 
   constructor(
     input: AsyncIterable<string>,
@@ -779,6 +787,10 @@ export class ImIO extends StructuredIO {
         if (toolUseId) {
           this.toolUseIdByBlockIndex.delete(blockIndex)
           await this.updateToolCardStatus(toolUseId, '_Running..._')
+
+          const toolInfo = this.toolCardsByToolUseId.get(toolUseId)
+          if (toolInfo && toolInfo.toolName == TODO_WRITE_TOOL_NAME)
+            await this.updateTodoListCard(toolInfo)
         }
 
         await this.finalizeStreamingCard()
@@ -1057,6 +1069,114 @@ export class ImIO extends StructuredIO {
     }
   }
 
+  protected buildTodoListMarkdown(todoList: TodoList | null): string {
+    if (todoList === null) {
+      return '_Waiting for todo results..._'
+    }
+
+    if (todoList.length === 0) {
+      return '_All todos completed_'
+    }
+
+    const lines = []
+    for (const todo of todoList) {
+      const label = todo.status === 'in_progress' ? todo.activeForm : todo.content
+      lines.push(
+        `- ${this.getTodoStatusIcon(todo.status)} ${this.truncateCardText(label, 400).replace(/\n/g, ' ')}`,
+      )
+    }
+    return lines.join('\n')
+  }
+
+  protected getTodoStatusIcon(status: TodoList[number]['status']): string {
+    switch (status) {
+      case 'completed':
+        return '✅'
+      case 'in_progress':
+        return '🔄'
+      case 'pending':
+      default:
+        return '⬜'
+    }
+  }
+
+  private async ensureTodoListCard()
+  {
+    if (this.todoListCard) {
+      return this.todoListCard
+    }
+
+    const { cardId, messageId } = await this.sendCard(
+      this.buildTodoListCard({
+        cardId: '',
+        messageId: '',
+        sequence: 0,
+        todoList: null,
+      }),
+    )
+
+    this.todoListCard = {
+      cardId,
+      messageId,
+      sequence: 1,
+      todoList: []
+    }
+
+    return this.todoListCard
+  }
+
+  private async updateTodoListCard(toolInfo: ToolCardState)
+  {
+    const state = await this.ensureTodoListCard()
+    try {
+      var inputJson = JSON.parse(toolInfo.inputJson)
+    }
+    catch(ex)
+    {
+      return
+    }
+    var todos = await this.extractTodoListFromToolInput(inputJson)
+    if (todos)
+    {
+      state.todoList = todos
+      await this.refreshTodoListCard()
+    }
+  }
+
+  protected async refreshTodoListCard(): Promise<void> {
+    const state = this.todoListCard
+    if (!state) {
+      return
+    }
+
+    await this.updateCardFull(
+      state.cardId,
+      this.buildTodoListCard(state),
+      this.nextCardSequence(state),
+    )
+  }
+
+  protected buildTodoListCard(state: TodoListCardState): Record<string, unknown> {
+    return {
+      schema: '2.0',
+      header: {
+        title: {
+          tag: 'plain_text',
+          content: 'Todo List',
+        },
+      },
+      body: {
+        elements: [
+          {
+            tag: 'markdown',
+            content: this.buildTodoListMarkdown(state.todoList),
+            element_id: TOOL_CARD_RESULT_ELEMENT_ID,
+          },
+        ],
+      },
+    }
+  }
+
   protected buildToolCardComplete(
     state: ToolCardState
   ): Record<string, unknown> {
@@ -1108,9 +1228,9 @@ export class ImIO extends StructuredIO {
               {
                 tag: 'markdown',
                 content: this.buildCodeBlockMarkdown(
-                  state.isError ? 'Result (Error)' : 'Result',
-                  state.resultText,
-                ),
+                        state.isError ? 'Result (Error)' : 'Result',
+                        state.resultText,
+                      ),
                 element_id: TOOL_CARD_RESULT_ELEMENT_ID,
               },
             ]
@@ -1408,23 +1528,22 @@ export class ImIO extends StructuredIO {
     if (FEISHU_COMPACT_TOOL_CALL_DISPLAY) {
       return true
     }
-    else {
-      await this.updateCardElement(
-        state.cardId,
-        TOOL_CARD_INPUT_ELEMENT_ID,
-        {
-          tag: 'markdown',
-          content: this.buildCodeBlockMarkdown(
-                    'Input',
-                    this.formatJsonPreview(state.inputJson) || '{}',
-                    'json',
-                  ),
-          element_id: TOOL_CARD_INPUT_ELEMENT_ID,
-        },
-        this.nextCardSequence(state),
-      )
-      return true
-    }
+
+    await this.updateCardElement(
+      state.cardId,
+      TOOL_CARD_INPUT_ELEMENT_ID,
+      {
+        tag: 'markdown',
+        content: this.buildCodeBlockMarkdown(
+          'Input',
+          this.formatJsonPreview(state.inputJson) || '{}',
+          'json',
+        ),
+        element_id: TOOL_CARD_INPUT_ELEMENT_ID,
+      },
+      this.nextCardSequence(state),
+    )
+    return true
   }
 
   protected async handleToolProgressMessage(
@@ -1537,6 +1656,49 @@ export class ImIO extends StructuredIO {
     }
 
     return '[tool_result]'
+  }
+
+  protected extractTodoListFromToolInput(
+    input: unknown,
+  ): TodoList | null {
+    if (!input || typeof input !== 'object') {
+      return null
+    }
+
+    const candidate = (input as { todos?: unknown }).todos
+    if (!Array.isArray(candidate)) {
+      return null
+    }
+
+    const todos: TodoList = []
+    for (const item of candidate) {
+      if (!item || typeof item !== 'object') {
+        return null
+      }
+
+      const todo = item as {
+        content?: unknown
+        activeForm?: unknown
+        status?: unknown
+      }
+      if (
+        typeof todo.content !== 'string' ||
+        typeof todo.activeForm !== 'string' ||
+        (todo.status !== 'pending' &&
+          todo.status !== 'in_progress' &&
+          todo.status !== 'completed')
+      ) {
+        return null
+      }
+
+      todos.push({
+        content: todo.content,
+        activeForm: todo.activeForm,
+        status: todo.status,
+      })
+    }
+
+    return todos
   }
 
   protected async appendToolResultElement(
