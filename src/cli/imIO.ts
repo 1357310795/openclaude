@@ -1188,8 +1188,9 @@ export class ImIO extends StructuredIO {
     const curTools = state.toolUseIds.map(id => this.toolCardsByToolUseId.get(id)!)
     const pendingTools = curTools.filter(tool => !tool.finalized)
     const completedTools = curTools.filter(tool => tool.finalized)
-    const visibleCompletedTools = pendingTools.length >= 2 ? [] : completedTools.slice(-2 + pendingTools.length)
-    const visibleTools = [...pendingTools, ...visibleCompletedTools]
+    const visibleCompletedTools =
+      pendingTools.length >= 2 ? [] : completedTools.slice(-(2 - pendingTools.length))
+    const visibleTools = [...visibleCompletedTools, ...pendingTools]
     const hiddenCompletedCount = completedTools.length - visibleCompletedTools.length
     const lines: string[] = []
 
