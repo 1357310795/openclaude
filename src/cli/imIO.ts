@@ -1745,6 +1745,10 @@ export class ImIO extends StructuredIO {
           : 'OpenClaude 请求退出 plan mode，请审核计划。',
     }
 
+    if (FEISHU_COMPACT_TOOL_CALL_DISPLAY) {
+      await this.closeCompactToolCard()
+    }
+
     await this.sendFeishuMessage(
       this.buildTextSendRequest(
         this.buildPlanApprovalMarkdown(this.pendingPlanApproval),
