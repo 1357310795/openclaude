@@ -1,14 +1,18 @@
+import { resolve } from 'node:path'
 import {
   getGithubEndpointType,
   isLocalProviderUrl,
   resolveCodexApiCredentials,
   resolveProviderRequest,
 } from '../services/api/providerConfig.js'
+import { getGlobalClaudeFile } from './env.js'
+import { isBareMode } from './envUtils.js'
 import {
   type GeminiResolvedCredential,
   resolveGeminiCredential,
 } from './geminiAuth.js'
-import { redactSecretValueForDisplay } from './providerProfile.js'
+import { PROFILE_FILE_NAME } from './providerProfile.js'
+import { redactSecretValueForDisplay } from './providerSecrets.js'
 
 function isEnvTruthy(value: string | undefined): boolean {
   if (!value) return false
@@ -61,6 +65,17 @@ function checkGithubTokenStatus(
   return 'valid'
 }
 
+function getOpenAIMissingKeyMessage(): string {
+  const globalConfigPath = getGlobalClaudeFile()
+  const profilePath = resolve(process.cwd(), PROFILE_FILE_NAME)
+
+  return [
+    'OPENAI_API_KEY is required when CLAUDE_CODE_USE_OPENAI=1 and OPENAI_BASE_URL is not local.',
+    `To recover, run /provider and switch provider, or set CLAUDE_CODE_USE_OPENAI=0 in your shell environment.`,
+    `Saved startup settings can come from ${globalConfigPath} or ${profilePath}.`,
+  ].join('\n')
+}
+
 export async function getProviderValidationError(
   env: NodeJS.ProcessEnv = process.env,
   options?: {
@@ -69,6 +84,7 @@ export async function getProviderValidationError(
     ) => Promise<GeminiResolvedCredential>
   },
 ): Promise<string | null> {
+  const secretSource = env
   const useOpenAI = isEnvTruthy(env.CLAUDE_CODE_USE_OPENAI)
   const useGithub = isEnvTruthy(env.CLAUDE_CODE_USE_GITHUB)
 
@@ -118,16 +134,17 @@ export async function getProviderValidationError(
   if (request.transport === 'codex_responses') {
     const credentials = resolveCodexApiCredentials(env)
     if (!credentials.apiKey) {
+      const oauthHint = isBareMode() ? '' : ', choose Codex OAuth in /provider'
       const authHint = credentials.authPath
-        ? ` or put auth.json at ${credentials.authPath}`
-        : ''
+        ? `${oauthHint} or put auth.json at ${credentials.authPath}`
+        : oauthHint
       const safeModel =
-        redactSecretValueForDisplay(request.requestedModel, env) ??
+        redactSecretValueForDisplay(request.requestedModel, secretSource) ??
         'the requested model'
       return `Codex auth is required for ${safeModel}. Set CODEX_API_KEY${authHint}.`
     }
     if (!credentials.accountId) {
-      return 'Codex auth is missing chatgpt_account_id. Re-login with Codex or set CHATGPT_ACCOUNT_ID/CODEX_ACCOUNT_ID.'
+      return 'Codex auth is missing chatgpt_account_id. Re-login with Codex OAuth, Codex CLI, or set CHATGPT_ACCOUNT_ID/CODEX_ACCOUNT_ID.'
     }
     return null
   }
@@ -137,7 +154,7 @@ export async function getProviderValidationError(
     if (useGithub && hasGithubToken) {
       return null
     }
-    return 'OPENAI_API_KEY is required when CLAUDE_CODE_USE_OPENAI=1 and OPENAI_BASE_URL is not local.'
+    return getOpenAIMissingKeyMessage()
   }
 
   return null
@@ -151,4 +168,45 @@ export async function validateProviderEnvOrExit(
     console.error(error)
     process.exit(1)
   }
+}
+
+export function shouldExitForStartupProviderValidationError(options: {
+  args?: string[]
+  stdoutIsTTY?: boolean
+} = {}): boolean {
+  const args = options.args ?? process.argv.slice(2)
+  const stdoutIsTTY = options.stdoutIsTTY ?? process.stdout.isTTY
+
+  if (!stdoutIsTTY) {
+    return true
+  }
+
+  return (
+    args.includes('-p') ||
+    args.includes('--print') ||
+    args.includes('--init-only') ||
+    args.some(arg => arg.startsWith('--sdk-url'))
+  )
+}
+
+export async function validateProviderEnvForStartupOrExit(
+  env: NodeJS.ProcessEnv = process.env,
+  options?: {
+    args?: string[]
+    stdoutIsTTY?: boolean
+  },
+): Promise<void> {
+  const error = await getProviderValidationError(env)
+  if (!error) {
+    return
+  }
+
+  if (shouldExitForStartupProviderValidationError(options)) {
+    console.error(error)
+    process.exit(1)
+  }
+
+  console.error(
+    `Warning: provider configuration is incomplete.\n${error}\nOpenClaude will continue starting so you can run /provider and repair the saved provider settings.`,
+  )
 }
